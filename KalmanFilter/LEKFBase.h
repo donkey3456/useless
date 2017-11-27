@@ -109,6 +109,9 @@ namespace ekf
 		GaussDistributionInfo State() { return _state; }
 		StateDataType Mean() { return _state._mean; }
 		StateCovarianceType Covariance() { return _state._covariance; }
+
+		void SetMean(StateDataType state) { _state._mean = state; }
+		void SetCovariance(StateCovarianceType cov) { _state._covariance = cov; }
 		bool IsValid() { return _state._valid; }
 	protected:
 		bool _updated;
@@ -135,6 +138,13 @@ namespace ekf
 			state._mean = PredictState(last_state._mean);
 			StateJacobianType jacobian = Linearization(last_state._mean);
 			state._covariance = jacobian * last_state._covariance * jacobian.transpose() + _covariance;
+			// 有measurement之后再update covariance
+// 			if (state._valid)
+// 			{
+// 				StateJacobianType jacobian = Linearization(last_state._mean);
+// 				state._covariance = jacobian * last_state._covariance * jacobian.transpose() + _covariance;
+// 			}
+
 		}
 
 	protected:
@@ -207,13 +217,13 @@ namespace ekf
 		
 		virtual void Update(const GaussDistributionInfo& last_state, GaussDistributionInfo& state)
 		{
-			MeasurementDataType residual = Residual(last_state._mean);
 			MeasurementJacobianType jacobian = Linearization(last_state._mean);
+			MeasurementDataType residual = Residual(last_state._mean);
 			MeasurementCovarianceType residual_cov = jacobian * last_state._covariance * jacobian.transpose() + _covariance;
 			GainType gain = last_state._covariance * jacobian.transpose() * residual_cov.inverse();
 			state._mean = last_state._mean + gain * residual;
-			state._covariance = last_state._covariance - gain * residual_cov * gain.transpose();
-			std::cerr << gain*jacobian << std::endl;
+			state._covariance = _covariance * residual_cov.inverse() * last_state._covariance;
+
 			state._valid = true;
 		}
 
@@ -319,6 +329,9 @@ namespace ekf
 			_measurements.push_back(measure);
 			OutdateState();
 		}
+
+		virtual void SetInitialEsitimate(StateDataType state) { _state_recorder->SetMean(state); }
+		virtual void SetInitialCovariance(StateCovarianceType cov) { _state_recorder->SetCovariance(cov); }
 
 		virtual StateDataType CurrentEstimiate() { return _state_recorder->Mean(); };
 		virtual StateCovarianceType CurrentCovariance() { return _state_recorder->Covariance(); }

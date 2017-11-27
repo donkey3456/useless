@@ -24,7 +24,16 @@ namespace ekf
 
 	Eigen::Matrix3d LControl2D::Linearization(const Eigen::Vector3d& state)
 	{
-		return Eigen::Matrix3d::Identity();
+
+		Eigen::Matrix3d res = Eigen::Matrix3d::Identity();
+		double cost = cos(state(2));
+		double sint = sin(state(2));
+		double xu = _control(0);
+		double yu = _control(1);
+		res(0, 2) = -xu * sint - yu * cost;
+		res(1, 2) = xu * cost - yu *sint;
+
+		return res;
 	}
 
 	LMeasurement2D::LMeasurement2D(int stamp /*= -1*/)
