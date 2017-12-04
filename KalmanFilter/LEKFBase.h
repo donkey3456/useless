@@ -5,7 +5,9 @@
 #include <memory>
 #include <limits>
 #include <list>
+#include <queue>
 #include <set>
+#include <mutex>
 
 #define _USE_MATH_DEFINES
 #include <math.h>
@@ -25,20 +27,17 @@ namespace ekf
 	{
 	public:
 		typedef std::shared_ptr<LProcessObj> LPtrProcessObj;
-		struct ProcessOrderPrior
+		virtual bool LessPriorThan (const LPtrProcessObj& rhs) const
 		{
-			bool operator()(const LPtrProcessObj& lhs, const LPtrProcessObj& rhs)
+			if (_stamp == rhs->_stamp)
 			{
-				if (lhs->_stamp == rhs->_stamp)
-				{
-					return lhs->ProcessOrder() < rhs->ProcessOrder();
-				}
-				else
-				{
-					return lhs->_stamp < rhs->_stamp;
-				}
+				return ProcessOrder() > rhs->ProcessOrder();
 			}
-		};
+			else
+			{
+				return _stamp > rhs->_stamp;
+			}
+		}
 	public:
 		LProcessObj(int stamp = -1) :_stamp(stamp) {};
 		virtual ~LProcessObj() {};
@@ -47,11 +46,12 @@ namespace ekf
 			assert(stamp >= -1);
 			_stamp = stamp;
 		}
-		virtual int ProcessOrder() const = 0;
-
+		int Stamp() { return _stamp; }
 	protected:
+		virtual int ProcessOrder() const = 0; // overloaded in LControl & LMeasurement
 		int _stamp;
 	};
+
 
 	template<int StateDimension>
 	class LBaseObject: public LProcessObj
@@ -59,66 +59,56 @@ namespace ekf
 	public:
 		EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 	protected:
-		typedef Eigen::Matrix<double, StateDimension, 1, Eigen::ColMajor> StateDataType;
-		typedef Eigen::Matrix<double, StateDimension, StateDimension, Eigen::ColMajor> StateCovarianceType;
-		typedef Eigen::Matrix<double, StateDimension, StateDimension, Eigen::ColMajor> StateJacobianType;
+		typedef Eigen::Matrix<double, StateDimension, 1, Eigen::ColMajor> StateVector;
+		typedef Eigen::Matrix<double, StateDimension, StateDimension, Eigen::ColMajor> StateCovariance;
+		typedef Eigen::Matrix<double, StateDimension, StateDimension, Eigen::ColMajor> StateJacobian;
 	public:
-		struct GaussDistributionInfo
+		struct GaussDistribution
 		{
-			GaussDistributionInfo()
+			GaussDistribution()
 			{
-				_valid = false; 
-				_mean = StateDataType::Zero();
-				_covariance = StateCovarianceType::Identity()*1e10;
+				_mean = StateVector::Zero();
+				_covariance = StateCovariance::Identity()*1e10;
 			}
 
-			bool _valid;
-			StateDataType _mean;
-			StateCovarianceType _covariance;
+			StateVector _mean;
+			StateCovariance _covariance;
 		};
 
 	public:
-		LBaseObject(int stamp = -1) :LProcessObj(stamp) {};
+		LBaseObject(int stamp = -1) :LProcessObj(stamp),_updated(false) {};
 		virtual ~LBaseObject() {};
 
-		virtual void Update(const GaussDistributionInfo& last_state, GaussDistributionInfo& state) = 0;
+		void Update(const GaussDistribution& last_state, GaussDistribution& state)
+		{
+			_pre_state = last_state;
+			UpdateImpl();
+			state = _post_state;
+			_updated = true;
+		};		
+		bool Updated() { return _updated; }
+		GaussDistribution GetPostState() { return _post_state; }
+
+	protected:
+		virtual void UpdateImpl() = 0; // overloaded in LControl & LBaseMeasurement
+
+	protected:
+		GaussDistribution _pre_state;
+		GaussDistribution _post_state;
+		bool _updated;
 	};
-
-
 
 	template<int StateDimension>
-	class LStateRecorder : public LBaseObject<StateDimension>
+	class LStateRecorder :public LBaseObject<StateDimension>
 	{
 	public:
-		EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-	public:
-		LStateRecorder(int stamp = -1) :
-			LBaseObject<StateDimension>(stamp), _updated(false)
-		{};
-		virtual ~LStateRecorder() {};
+		LStateRecorder(int stamp = -1):LBaseObject<StateDimension>(stamp) {}
 
-		virtual int ProcessOrder() const { return 2; }
-		virtual void SetOutdated() { _updated = false; };
-		virtual void Update(const GaussDistributionInfo& last_state, GaussDistributionInfo& state)
-		{
-			state = _state = last_state;
-			_updated = true;
-		}
-
-		bool Updated() { return _updated; }
-		GaussDistributionInfo State() { return _state; }
-		StateDataType Mean() { return _state._mean; }
-		StateCovarianceType Covariance() { return _state._covariance; }
-
-		void SetMean(StateDataType state) { _state._mean = state; }
-		void SetCovariance(StateCovarianceType cov) { _state._covariance = cov; }
-		bool IsValid() { return _state._valid; }
 	protected:
-		bool _updated;
-		GaussDistributionInfo _state;
+		virtual void UpdateImpl() { _post_state = _pre_state; }
+		virtual int ProcessOrder() const { return 0; }
+
 	};
-
-
 
 	template<int StateDimension>
 	class LControl : public LBaseObject<StateDimension>
@@ -128,45 +118,36 @@ namespace ekf
 
 	public:
 		LControl(int stamp = -1) :
-			LBaseObject<StateDimension>(stamp),_covariance(StateCovarianceType::Identity()){};
+			LBaseObject<StateDimension>(stamp){};
 		virtual ~LControl() {};
 
-		virtual int ProcessOrder() const { return 0; }
-		virtual void SetCovariance(StateCovarianceType c) { _covariance = c; }
-		virtual void Update(const GaussDistributionInfo& last_state, GaussDistributionInfo& state)
-		{
-			state._mean = PredictState(last_state._mean);
-			StateJacobianType jacobian = Linearization(last_state._mean);
-			state._covariance = jacobian * last_state._covariance * jacobian.transpose() + _covariance;
-			// 有measurement之后再update covariance
-// 			if (state._valid)
-// 			{
-// 				StateJacobianType jacobian = Linearization(last_state._mean);
-// 				state._covariance = jacobian * last_state._covariance * jacobian.transpose() + _covariance;
-// 			}
-
-		}
-
 	protected:
-		virtual StateDataType PredictState(const StateDataType&) = 0;
-		virtual StateJacobianType Linearization(const StateDataType& state)
+		virtual int ProcessOrder() const { return 0; }
+		virtual void UpdateImpl()
 		{
-			StateJacobianType jacobian;
-			StateDataType predicted_state = PredictState(state);
+			_post_state._mean = PredictState(_pre_state._mean);
+			StateJacobian jacobian = Fx(_pre_state._mean);
+			StateCovariance covariance = CalControlCovariance(_pre_state._mean);
+			_post_state._covariance = jacobian * _pre_state._covariance * jacobian.transpose() + covariance;
+		}
+		virtual StateCovariance CalControlCovariance(const StateVector&) = 0; // overloaded in LBaseControl 
+		virtual StateVector PredictState(const StateVector&) = 0; // overloaded in LBaseControl 
+		virtual StateJacobian Fx(const StateVector& state)
+		{
+			StateJacobian jacobian;
+			StateVector predicted_state = PredictState(state);
 			for (int i = 0; i < StateDimension; i++)
 			{
-				StateDataType delta = StateDataType::Zero();
+				StateVector delta = StateVector::Zero();
 				delta(i) = 1e-6;
-				StateDataType temp = state + delta;
-				StateDataType predicted_state_new = PredictState(temp);
+				StateVector temp = state + delta;
+				StateVector predicted_state_new = PredictState(temp);
 				jacobian.block(0, i, StateDimension, 1) = (predicted_state_new - predicted_state) * 1e6;
 			}
 			return jacobian;
 		}
-
-	protected:
-		StateCovarianceType _covariance;
 	};
+
 
 	template<int StateDimension, int ControlDimension = StateDimension>
 	class LBaseControl: public LControl<StateDimension>
@@ -174,16 +155,44 @@ namespace ekf
 	public:
 		EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 	protected:
-		typedef Eigen::Matrix<double, ControlDimension, 1, Eigen::ColMajor> ControlDataType;
-
+		typedef Eigen::Matrix<double, ControlDimension, 1, Eigen::ColMajor> ControlVector;
+		typedef Eigen::Matrix<double, ControlDimension, ControlDimension, Eigen::ColMajor> ControlCovarance;
+		typedef Eigen::Matrix<double, StateDimension, ControlDimension, Eigen::ColMajor> ControlJacobian;
 	public:
 		LBaseControl(int stamp = -1) :LControl<StateDimension>(stamp) {};
 		virtual ~LBaseControl() {};
 
-		virtual void SetControl(ControlDataType c) { _control = c; }
+		virtual void SetControl(const ControlVector& c) { _control = c; }
+		virtual void SetControlCovariance(const ControlCovarance& c) { _covariance = c; }
 
 	protected:
-		ControlDataType _control;
+		virtual StateVector PredictState(const StateVector& state)
+		{
+			return PredictStateImpl(state, _control);
+		}
+		virtual StateVector PredictStateImpl(const StateVector& state, const ControlVector& control) = 0; // overloaded by user
+		virtual StateCovariance CalControlCovariance(const StateVector& state) 
+		{
+			ControlJacobian jacobian = Fu(state);
+			return jacobian * _covariance * jacobian.transpose();
+		}
+		virtual ControlJacobian Fu(const StateVector& state)
+		{
+			ControlCovarance jacobian;
+			StateVector predicted_state = PredictState(state);
+			for (int i = 0; i < ControlDimension; i++)
+			{
+				ControlVector delta = ControlVector::Zero();
+				delta(i) = 1e-6;
+				ControlVector temp = _control + delta;
+				StateVector predicted_state_new = PredictStateImpl(state,temp);
+				jacobian.block(0, i, StateDimension, 1) = (predicted_state_new - predicted_state) * 1e6;
+			}
+			return jacobian;
+		}
+	protected:
+		ControlVector _control;
+		ControlCovarance _covariance;
 	};
 
 
@@ -199,183 +208,215 @@ namespace ekf
 	};
 
 
-	template<int MeasurementDimension,int StateDimension = MeasurementDimension>
+	template<int StateDimension,int MeasurementDimension = StateDimension>
 	class LBaseMeasurement:public LMeasurement<StateDimension>
 	{
 	public:
 		EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 	protected:
-		typedef Eigen::Matrix<double, MeasurementDimension, 1, Eigen::ColMajor> MeasurementDataType;
-		typedef Eigen::Matrix<double, MeasurementDimension, MeasurementDimension, Eigen::ColMajor> MeasurementCovarianceType;
-		typedef Eigen::Matrix<double, MeasurementDimension, StateDimension, Eigen::ColMajor> MeasurementJacobianType;
-		typedef Eigen::Matrix<double, StateDimension, MeasurementDimension, Eigen::ColMajor> GainType;
+		typedef Eigen::Matrix<double, MeasurementDimension, 1, Eigen::ColMajor> MeasurementVector;
+		typedef Eigen::Matrix<double, MeasurementDimension, MeasurementDimension, Eigen::ColMajor> MeasurementCovariance;
+		typedef Eigen::Matrix<double, MeasurementDimension, StateDimension, Eigen::ColMajor> MeasurementJacobian;
+		typedef Eigen::Matrix<double, StateDimension, MeasurementDimension, Eigen::ColMajor> Gain;
 
 	public:
 		LBaseMeasurement(int stamp = -1): LMeasurement<StateDimension>(stamp){};
 		virtual ~LBaseMeasurement() {};
 
-		
-		virtual void Update(const GaussDistributionInfo& last_state, GaussDistributionInfo& state)
-		{
-			MeasurementJacobianType jacobian = Linearization(last_state._mean);
-			MeasurementDataType residual = Residual(last_state._mean);
-			MeasurementCovarianceType residual_cov = jacobian * last_state._covariance * jacobian.transpose() + _covariance;
-			GainType gain = last_state._covariance * jacobian.transpose() * residual_cov.inverse();
-			state._mean = last_state._mean + gain * residual;
-			state._covariance = _covariance * residual_cov.inverse() * last_state._covariance;
-
-			state._valid = true;
-		}
-
-		// check residual, maybe use this to remove outlier
-		virtual MeasurementDataType Residual(StateDataType state)
+		virtual MeasurementVector Residual(StateVector state)
 		{
 			return _measurement - MeasurementFuncion(state);
 		}
+		virtual void SetMeasurement(MeasurementVector m) { _measurement = m; }
+		virtual void setMeasurementCovariance(MeasurementCovariance c) { _covariance = c; }
 
-		virtual void SetMeasurement(MeasurementDataType m) { _measurement = m; }
-		virtual void setMeasurementCovariance(MeasurementCovarianceType c) { _covariance = c; }
 	protected:
-		virtual MeasurementDataType MeasurementFuncion(StateDataType) = 0;
-		virtual MeasurementJacobianType Linearization(const StateDataType& state)
+		virtual void UpdateImpl()
 		{
-			MeasurementJacobianType jacobian;
-			MeasurementDataType measure = MeasurementFuncion(state);
+			MeasurementJacobian jacobian = Linearization(_pre_state._mean);
+			MeasurementVector residual = Residual(_pre_state._mean);
+			MeasurementCovariance residual_cov = jacobian * _pre_state._covariance * jacobian.transpose() + _covariance;
+			Gain gain = _pre_state._covariance * jacobian.transpose() * residual_cov.inverse();
+			_post_state._mean = _pre_state._mean + gain * residual;
+			//_logger.Err() << (jacobian.transpose() * jacobian).inverse();
+			//_post_state._covariance = (jacobian.transpose() * jacobian).inverse() * jacobian.transpose() * _covariance * residual_cov.inverse() * jacobian * _pre_state._covariance;
+			_post_state._covariance = (StateCovariance::Identity() - gain * jacobian) * _pre_state._covariance;
+		}
+
+		// check residual, maybe use this to remove outlier
+		virtual MeasurementVector MeasurementFuncion(StateVector) = 0; // overloaded by user
+		virtual MeasurementJacobian Linearization(const StateVector& state)
+		{
+			MeasurementJacobian jacobian;
+			MeasurementVector measure = MeasurementFuncion(state);
 			for (int i = 0; i < StateDimension; i++)
 			{
-				StateDataType delta = StateDataType::Zero();
+				StateVector delta = StateVector::Zero();
 				delta(i) = 1e-6;
-				StateDataType temp = state + delta;
-				MeasurementDataType measure_new = MeasurementFuncion(temp);
+				StateVector temp = state + delta;
+				MeasurementVector measure_new = MeasurementFuncion(temp);
 				jacobian.block(0, i, MeasurementDimension, 1) = (measure_new - measure) * 1e6;
 			}
 			return jacobian;
 		}
 	protected:
-		MeasurementDataType _measurement;
-		MeasurementCovarianceType _covariance;
+		MeasurementVector _measurement;
+		MeasurementCovariance _covariance;
 	};
 
 	template<int StateDimension>
-	class LBaseEKF :public LoggableObj
+	class LEKF :public LoggableObj
 	{
 	public:
 		EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 	protected:
-		typedef Eigen::Matrix<double, StateDimension, 1, Eigen::ColMajor> StateDataType;
-		typedef Eigen::Matrix<double, StateDimension, StateDimension, Eigen::ColMajor> StateCovarianceType;
-		typedef std::shared_ptr<LBaseObject<StateDimension>> ProcessObjType;
-		typedef std::shared_ptr<LControl<StateDimension>> ControlType;
-		typedef std::shared_ptr<LStateRecorder<StateDimension>> StateRecorderType;
-		typedef std::shared_ptr<LMeasurement<StateDimension>> MeasurementType;
+		typedef Eigen::Matrix<double, StateDimension, 1, Eigen::ColMajor> StateVector;
+		typedef Eigen::Matrix<double, StateDimension, StateDimension, Eigen::ColMajor> StateCovariance;
+		typedef std::shared_ptr<LBaseObject<StateDimension>> ProcessObj;
+		typedef std::shared_ptr<LBaseControl<StateDimension>> Control;
+		typedef std::shared_ptr<LMeasurement<StateDimension>> Measurement;
 	public:
-		LBaseEKF() {}
-		virtual ~LBaseEKF() {}
+		LEKF() 
+		{
+			_buffersize = 100;
+			auto pobj = make_shared<LStateRecorder<StateDimension>>();
+			LStateRecorder<StateDimension>::GaussDistribution state;
+			pobj->Update(LStateRecorder<StateDimension>::GaussDistribution(), state);
+			_processobjs.push_back(pobj);
+			_updated = true;
+		}
 
+		virtual ~LEKF() {}
 
-		virtual StateDataType CurrentEstimiate() = 0;
-		virtual StateCovarianceType CurrentCovariance() = 0;
-		virtual bool Valid() = 0;
-		virtual void Update() = 0;
-	protected:
-		virtual void OutdateState() = 0;
+		void SetControlBufferSize(int size) 
+		{ 
+			if (size<=0)
+			{
+				_logger.Err() << "Buffer size should larger than 0!!!" << endl;
+				return;
+			}
+			_buffersize = size;
+		}
 
+		virtual void AddControl(Control control)
+		{
+			std::lock_guard<std::mutex> locker(_mutex_objs);
+			if (_controls.size() != 0 && control->Stamp() < _controls.back()->Stamp())
+			{
+				_logger.Err() << "Unexpected order of the controls!!!" << endl;
+				return;
+			}
+			_controls.push(control);
+			_processobjs.push_back(control);
+			_updated = false;
 
-	protected:
+		}
 
+		virtual void AddMeasurement(Measurement measurement)
+		{
+			std::lock_guard<std::mutex> locker(_mutex_objs);
+			if (_controls.size() != 0 && measurement->Stamp() > _controls.back()->Stamp())
+			{
+				_logger.Err() << "Unexpected order of the measurements!!!" << endl;
+				return;
+			}
 
-	};
+			// insert new obj
+			auto reverse_iter = _processobjs.rbegin();
 
-	template<int StateDimension>
-	class LSimpleEKF : public LBaseEKF<StateDimension>
-	{
-	public:
-		EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+			while (reverse_iter != _processobjs.rend())
+			{
+				ProcessObj obj = *reverse_iter;
+				if (!obj->LessPriorThan(measurement))
+				{
+					break;
+				}
+				reverse_iter++;
+			}
 
-
-	public:
-		LSimpleEKF() :_state_recorder(new LStateRecorder<StateDimension>) {}
-		virtual ~LSimpleEKF() {}
+			if (reverse_iter == _processobjs.rend())
+			{
+				_logger.Err() << "The new measurement is outdated!!!" << endl;
+				return;
+			}
+			_processobjs.insert(reverse_iter.base(), measurement);
+			_updated = false;
+		}
 
 		virtual void Update()
 		{
-			auto state = _state_recorder->State();
-			for (auto control : _controls)
+			std::lock_guard<std::mutex> locker(_mutex_objs);
+
+			auto iter = _processobjs.begin();
+			ProcessObj obj;
+			while (iter != _processobjs.end())
 			{
+				obj = *iter;
+				if (!obj->Updated())
+				{
+					break;
+				}
+				iter++;
+			}
+			iter--;
+
+			obj = *iter;
+			auto state = obj->GetPostState();
+			iter++;
+			while (iter != _processobjs.end())
+			{
+				obj = *iter;
 				auto last_state = state;
-				control->Update(last_state, state);
+				obj->Update(last_state, state);
+				iter++;
 			}
 
-			for (auto measurement : _measurements)
+			if (_controls.size() > _buffersize)
 			{
-				auto last_state = state;
-				measurement->Update(last_state, state);
+				while (_controls.size() > _buffersize)
+				{
+					_controls.pop();
+				}
+				Control control = _controls.front();
+				auto iter = std::find(_processobjs.begin(), _processobjs.end(), control);
+				if (iter == _processobjs.end())
+				{
+					_logger.Err() << "Unexpected Error!! Can't find control in process objs." << endl;
+					return;
+				}
+
+				_processobjs.erase(_processobjs.begin(), --iter);
 			}
 
-			auto last_state = state;
-			_state_recorder->Update(last_state, state);
-			_controls.clear();
-			_measurements.clear();
-
+			_updated = true;
 		}
 
-		void AddControl(ControlType control)
+		virtual StateVector CurrentEstimiate()
 		{
-			_controls.push_back(control);
-			OutdateState();
+			if (!_updated)
+			{
+				Update();
+			}
+			return _processobjs.back()->GetPostState()._mean;
 		}
-		void AddMeasurement(MeasurementType measure)
+
+		virtual StateCovariance CurrentCovariance()
 		{
-			_measurements.push_back(measure);
-			OutdateState();
+			if (!_updated)
+			{
+				Update();
+			}
+			return _processobjs.back()->GetPostState()._covariance;
 		}
 
-		virtual void SetInitialEsitimate(StateDataType state) { _state_recorder->SetMean(state); }
-		virtual void SetInitialCovariance(StateCovarianceType cov) { _state_recorder->SetCovariance(cov); }
-
-		virtual StateDataType CurrentEstimiate() { return _state_recorder->Mean(); };
-		virtual StateCovarianceType CurrentCovariance() { return _state_recorder->Covariance(); }
-		virtual bool Valid() { return _state_recorder->IsValid(); }
 	protected:
-		virtual void OutdateState() { _state_recorder->SetOutdated(); }
-
-	protected:
-		StateRecorderType _state_recorder;
-		std::list<ControlType> _controls;
-		std::list<MeasurementType> _measurements;
-	};
-
-
-
-	template<int StateDimension>
-	class LBufferedEKF
-	{
-
-		typedef Eigen::Matrix<double, StateDimension, 1, Eigen::ColMajor> StateDataType;
-		typedef Eigen::Matrix<double, StateDimension, StateDimension, Eigen::ColMajor> StateCovarianceType;
-		typedef std::shared_ptr<LControl<StateDimension>> ControlType;
-	public:
-		EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-	public:
-		LBufferedEKF() {};
-		virtual ~LBufferedEKF() {};
-
-		StateDataType GetMean() { return _mean; }
-		StateCovarianceType GetCovariance() { return _covariance; }
-
-		void AddControl(ControlType control);
-		void AddMeasurement();
-
-
-	protected:
-		StateDataType _mean;
-		StateCovarianceType _covariance;
-
+		int _buffersize;
+		std::mutex _mutex_objs;
+		std::list<ProcessObj> _processobjs;
+		std::queue<Control> _controls;
+		bool _updated;
 
 	};
-
-
-
 
 
 

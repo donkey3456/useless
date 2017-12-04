@@ -7,22 +7,24 @@ namespace ekf
 	LControl2D::LControl2D(int stamp /*= -1*/)
 		:LBaseControl<3>(stamp) {}
 	
-	Eigen::Vector3d LControl2D::PredictState(const Eigen::Vector3d& last_state)
+	Eigen::Vector3d LControl2D::PredictStateImpl(const Eigen::Vector3d& last_state, const Eigen::Vector3d& control)
 	{
 		double last_theta = last_state(2);
 		double cost = cos(last_theta);
 		double sint = sin(last_theta);
 		Eigen::Vector3d res;
-		res(0) = _control(0) * cost - _control(1) * sint + last_state(0);
-		res(1) = _control(0) * sint + _control(1) * cost + last_state(1);
-		double theta = _control(2) + last_theta;
-		Eigen::Rotation2D<double> r(theta);
-		res(2) = r.smallestAngle();
+		res(0) = control(0) * cost - control(1) * sint + last_state(0);
+		res(1) = control(0) * sint + control(1) * cost + last_state(1);
+		res(2) = control(2) + last_theta;
+		//double theta = control(2) + last_theta;
+		//Eigen::Rotation2D<double> r(theta);
+		//res(2) = r.smallestAngle();
 
 		return res;
 	};
 
-	Eigen::Matrix3d LControl2D::Linearization(const Eigen::Vector3d& state)
+
+	Eigen::Matrix3d LControl2D::Fx(const Eigen::Vector3d& state)
 	{
 
 		Eigen::Matrix3d res = Eigen::Matrix3d::Identity();
@@ -48,6 +50,20 @@ namespace ekf
 	{
 
 		return Eigen::Matrix3d::Identity();
+	}
+
+	Eigen::Vector2d LMeasurementAruco::MeasurementFuncion(Eigen::Vector3d state)
+	{
+		double cost = cos(state(2));
+		double sint = sin(state(2));
+// 		double xm = _p_w_m(0);
+// 		double ym = _p_w_m(1);
+		double x = state(0);
+		double y = state(1);
+		Eigen::Vector2d res;
+		res(0) = xm * cost + ym *sint - x *cost - y*sint;
+		res(1) = - xm * sint + ym *cost + x *sint - y*cost;
+		return res;
 	}
 
 }
